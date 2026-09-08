@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, SequentialSampler
+from torch.utils.data import DataLoader, Dataset, SequentialSampler
 from tqdm import tqdm
 
 
@@ -17,8 +17,37 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from tsn.config import get_cfg_defaults  # noqa: E402
-from tsn.data.datasets.clipgcn_tensor_dataset import CLIPGCNTensorDataset  # noqa: E402
 from tsn.model.recognizers.build import build_recognizer  # noqa: E402
+
+try:
+    from tsn.data.datasets.clipgcn_tensor_dataset import CLIPGCNTensorDataset  # noqa: E402
+except ModuleNotFoundError:
+    class CLIPGCNTensorDataset(Dataset):
+        """Minimal reader for the local ETRI tensor cache.
+
+        This checkout does not include the historical ``tsn.data`` package;
+        the cache is already normalized, so feature extraction only needs a
+        deterministic mmap reader and the valid-row mask.
+        """
+
+        def __init__(self, data_dir, is_train=False, split="train", **_kwargs):
+            data_dir = Path(data_dir)
+            self.data = np.load(data_dir / f"{split}_float16.npy", mmap_mode="r")
+            self.labels = np.load(data_dir / f"{split}_labels.npy", mmap_mode="r")
+            valid_path = data_dir / f"{split}_valid.npy"
+            valid = (
+                np.load(valid_path, mmap_mode="r")
+                if valid_path.exists()
+                else np.ones(len(self.labels), dtype=bool)
+            )
+            self.valid_indices = np.flatnonzero(valid)
+
+        def __len__(self):
+            return len(self.valid_indices)
+
+        def __getitem__(self, index):
+            row = int(self.valid_indices[index])
+            return torch.from_numpy(np.array(self.data[row], copy=True)), int(self.labels[row])
 
 
 def parse_args():
@@ -193,6 +222,10 @@ def main():
 
     cfg = build_cfg(args)
     device = torch.device(args.device)
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
     model = build_recognizer(cfg, device=device)
     model.eval()
 
@@ -228,12 +261,21 @@ def main():
     features_out = None
     labels = []
 
-    with torch.no_grad():
+    with torch.inference_mode():
         write_start = 0
         for clips, targets in tqdm(loader, desc=f"Extracting {args.layer}"):
             captured.clear()
             clips = clips.to(device=device, non_blocking=True)
-            _ = model(clips)
+            resize = get_tensor_resize_size(cfg, args)
+            if resize > 0 and tuple(clips.shape[-2:]) != (resize, resize):
+                clips = F.interpolate(clips.float(), size=(clips.shape[2], resize, resize),
+                                      mode="trilinear", align_corners=False)
+            with torch.autocast(
+                device_type=device.type,
+                dtype=torch.float16,
+                enabled=device.type == "cuda",
+            ):
+                _ = model(clips)
             if "features" not in captured:
                 raise RuntimeError(f"Hook for layer '{args.layer}' did not capture any features")
 
