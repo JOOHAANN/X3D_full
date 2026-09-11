@@ -39,12 +39,18 @@ class DevicePrefetchLoader:
     """Overlap the next pinned-memory transfer with GPU computation."""
     def __init__(self, loader, device):
         self.loader, self.device = loader, device
+        # Reusing one stream across epochs is important here.  Creating a new
+        # CUDA stream from every ``__iter__`` call (one per epoch) leaves its
+        # allocator/workspace bookkeeping live for the lifetime of the
+        # process, which slowly increases nvidia-smi memory usage on long
+        # 7000-iteration runs.
+        self.stream = torch.cuda.Stream(device=device)
 
     def __len__(self):
         return len(self.loader)
 
     def __iter__(self):
-        stream = torch.cuda.Stream(device=self.device)
+        stream = self.stream
         source = iter(self.loader)
         def load():
             batch = next(source, None)
